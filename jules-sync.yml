@@ -1,0 +1,47 @@
+# jules-bitbucket-connection configuration.
+# Every setting under `defaults:` can also be set per repo entry.
+
+defaults:
+  # GitHub user or org that owns the mirror repos. Empty = the owner of the
+  # MIRROR_GITHUB_PAT token.
+  mirror_owner: ""
+
+  # Default mirror repo name is "<bitbucket repo slug><mirror_suffix>".
+  # Override per repo with `github_repo:`.
+  mirror_suffix: "-mirror"
+
+  # Create mirrors as private repos (recommended — Jules works fine with
+  # private repos once you grant its GitHub App access).
+  private_mirrors: true
+
+  # Automatically open a Bitbucket pull request when Jules publishes a new
+  # branch on the mirror.
+  create_bitbucket_prs: true
+
+  # Destination branch for those PRs. Empty = auto-detect the Bitbucket
+  # repo's main branch.
+  bitbucket_main_branch: ""
+
+  # Delete a mirror branch when its Bitbucket original is deleted.
+  # Off by default: deletions are never propagated unless you opt in.
+  prune_mirror_branches: false
+
+  # Sync tags Bitbucket -> GitHub (never force-updated).
+  sync_tags: true
+
+  # How Jules-created branches are recognized. Jules names branches
+  # "<slug>-<15-20 digit session id>", e.g. "fix-login-bug-1640409954249346636".
+  jules_branch_regex: "-\\d{15,}$"
+
+repos:
+  # One entry per Bitbucket repo you want to use with Jules:
+  #
+  # - bitbucket: myworkspace/my-repo          # required: workspace/repo-slug
+  #   github_repo: my-repo-mirror             # optional: mirror repo name
+  #   allow_existing: true                    # optional: adopt an existing,
+  #                                           #   non-empty GitHub repo as the
+  #                                           #   mirror (careful: its branches
+  #                                           #   will be force-overwritten)
+  #
+  # Delete this placeholder and add your own:
+  - bitbucket: your-workspace/your-repo

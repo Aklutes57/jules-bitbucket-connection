@@ -1,0 +1,64 @@
+name: Jules Bitbucket Sync
+
+on:
+  schedule:
+    # Every 15 minutes, off the top of the hour (GitHub delays runs that
+    # start at minute 0 during load spikes).
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [bitbucket-sync]   # optional instant trigger, see examples/
+  push:
+    branches: [main]
+    paths:
+      - jules-sync.yml
+      - scripts/**
+      - .github/workflows/jules-sync.yml
+
+permissions:
+  contents: write   # lets the job commit sync state back to this repo
+
+concurrency:
+  group: jules-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Sync Bitbucket <-> GitHub mirrors
+        env:
+          BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_TOKEN }}
+          BITBUCKET_EMAIL: ${{ secrets.BITBUCKET_EMAIL }}
+          MIRROR_GITHUB_PAT: ${{ secrets.MIRROR_GITHUB_PAT }}
+        run: python scripts/sync.py
+
+      - name: Commit sync state
+        if: always()
+        run: |
+          mkdir -p state
+          # Keepalive: scheduled workflows in public repos are disabled after
+          # 60 days without commits. If this repo has been quiet for 40+ days,
+          # refresh a heartbeat file so the schedule stays enabled.
+          last_commit=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $(( (now - last_commit) / 86400 )) -ge 40 ]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > state/.keepalive
+          fi
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name "jules-bitbucket-connection"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/
+            git commit -m "chore: update sync state"
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
+            git push
+          fi
