@@ -2,9 +2,12 @@ name: Jules Bitbucket Sync
 
 on:
   schedule:
-    # Every 15 minutes, off the top of the hour (GitHub delays runs that
-    # start at minute 0 during load spikes).
-    - cron: "7,22,37,52 * * * *"
+    # Every 30 minutes, off the top of the hour (GitHub delays runs that
+    # start at minute 0 during load spikes). If the bridge repo is PUBLIC,
+    # Actions minutes are free and you can safely tighten this to e.g.
+    # "7,22,37,52 * * * *"; on a private repo the default stays within
+    # GitHub's 2,000 free monthly minutes.
+    - cron: "11,41 * * * *"
   workflow_dispatch: {}
   repository_dispatch:
     types: [bitbucket-sync]   # optional instant trigger, see examples/
@@ -59,6 +62,20 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state/
             git commit -m "chore: update sync state"
-            git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
-            git push
+            ok=""
+            for i in 1 2 3; do
+              # -X theirs: during a rebase, "theirs" is our replayed state
+              # commit. State is recomputed from live branch reality every
+              # run, so the fresh copy wins any conflict.
+              if git pull --rebase -X theirs origin "${GITHUB_REF_NAME:-main}" \
+                 && git push origin "HEAD:${GITHUB_REF_NAME:-main}"; then
+                ok=1
+                break
+              fi
+              git rebase --abort 2>/dev/null || true
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::failed to push sync state after 3 attempts; a lost state commit can make the next run re-open PRs for merged Jules branches"
+              exit 1
+            fi
           fi

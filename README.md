@@ -5,8 +5,8 @@ Use **[Google Jules](https://jules.google)** with **Bitbucket** repositories.
 Jules only connects to GitHub. This bridge works around that: it keeps a
 GitHub **mirror** of each Bitbucket repo for Jules to work on, and syncs
 Jules' branches straight back to Bitbucket — where it can even open the pull
-request for you. No servers to run: everything happens in GitHub Actions on
-the free tier.
+request for you. No servers to run: everything happens in GitHub Actions
+(free if this repo is public — see [the cost note](#limitations--troubleshooting)).
 
 ```mermaid
 flowchart LR
@@ -21,8 +21,8 @@ flowchart LR
 
 ## How it works
 
-A scheduled GitHub Actions workflow in this repo (every 15 minutes, or
-seconds after each push with the [optional instant
+A scheduled GitHub Actions workflow in this repo (every 30 minutes by
+default, or seconds after each push with the [optional instant
 trigger](#optional-instant-sync)) runs a sync engine that enforces a simple
 ownership rule per branch:
 
@@ -47,7 +47,13 @@ GitHub-side PR and stays updated as Jules pushes more commits.
 ### 1. Get this repo
 
 Click **Use this template** (top right) to create your own copy, e.g.
-`your-user/jules-bitbucket-connection`. It can stay private.
+`your-user/jules-bitbucket-connection`.
+
+> **Public or private?** Public means unlimited free Actions minutes. The
+> bridge repo contains only this engine, your config, and sync state — no
+> source code — but the config and state do reveal your repo names and
+> branch names. Private keeps those hidden and fits inside GitHub's free
+> 2,000 minutes/month at the default 30-minute schedule.
 
 ### 2. Create two tokens
 
@@ -69,7 +75,9 @@ Click **Use this template** (top right) to create your own copy, e.g.
 mirrors):
 
 1. GitHub → Settings → Developer settings → [Fine-grained tokens](https://github.com/settings/personal-access-tokens/new).
-2. Resource owner: your user (or the org that should own the mirrors).
+2. Resource owner: your user — or, if the mirrors should live in an org,
+   pick the org here **and** set `mirror_owner: your-org` in
+   `jules-sync.yml` (step 4).
 3. Repository access: **All repositories** (required — the token must reach
    mirror repos that don't exist yet).
 4. Permissions → Repository permissions:
@@ -132,7 +140,7 @@ That's it. Give Jules a task on the mirror repo.
 
 ## Optional: instant sync
 
-Polling means up to ~15 minutes of latency (GitHub can also delay scheduled
+Polling means up to ~30 minutes of latency (GitHub can also delay scheduled
 runs). For sync within seconds of every Bitbucket push, add the small
 pipeline in [`examples/bitbucket-pipelines.yml`](examples/bitbucket-pipelines.yml)
 to your Bitbucket repo — it pings this repo's workflow through GitHub's
@@ -169,8 +177,15 @@ All settings live in [`jules-sync.yml`](jules-sync.yml); everything under
 
 ## Limitations & troubleshooting
 
-- **Latency**: without the instant trigger, changes travel on the 15-minute
-  poll (GitHub may add delay under load).
+- **Latency**: without the instant trigger, changes travel on the 30-minute
+  poll (GitHub may add delay under load). Jules' own pushes always travel on
+  the poll — tighten the cron in
+  [`.github/workflows/jules-sync.yml`](.github/workflows/jules-sync.yml) if
+  that's too slow for you.
+- **Cost**: on a **public** bridge repo, Actions minutes are free and you
+  can poll as often as every 5 minutes. On a **private** one, the default
+  30-minute schedule uses roughly 1,400 of GitHub's 2,000 free monthly
+  minutes — don't tighten the cron there without checking your plan.
 - **Merging on the wrong side**: if you merge a PR on the *mirror*, the next
   sync force-resets the mirror's main branch to Bitbucket's version and the
   merge is lost. Merge in Bitbucket.

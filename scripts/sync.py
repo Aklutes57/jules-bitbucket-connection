@@ -11,15 +11,17 @@ Ownership model (per branch):
   - Branches on Bitbucket that do NOT look like Jules branches are owned by
     Bitbucket: force-synced Bitbucket -> GitHub mirror.
   - Branches that look like Jules branches (trailing 15+ digit session id,
-    e.g. "fix-login-bug-1640409954249346636") or that exist only on the
-    GitHub mirror are owned by GitHub: synced GitHub -> Bitbucket so they
-    can be reviewed and merged in Bitbucket.
+    e.g. "fix-login-bug-1640409954249346636"), that first appeared on the
+    GitHub mirror, or that exist only on the mirror are owned by GitHub:
+    synced GitHub -> Bitbucket so they can be reviewed and merged in
+    Bitbucket.
   - Deletions are never propagated unless prune_mirror_branches is enabled.
   - Tags sync one way, Bitbucket -> GitHub, and are never force-updated.
 
-State files under state/ record which side each branch came from. The
-workflow commits them after every run; they prevent a branch deleted on one
-side from being resurrected by the other.
+State files under state/ record which side each branch came from and which
+Jules branches already have a Bitbucket PR. The workflow commits them after
+every run; they prevent a branch deleted on one side from being resurrected
+by the other, and make PR creation retry until it succeeds.
 
 Environment variables:
   BITBUCKET_TOKEN     required. Atlassian API token (scoped) or a Bitbucket
@@ -104,6 +106,8 @@ def api(url, headers, method="GET", body=None, allow=()):
             return e.code, None
         detail = e.read().decode(errors="replace")[:500]
         raise RuntimeError(f"{method} {url} -> HTTP {e.code}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"{method} {url} failed: {e.reason}") from None
 
 
 class Bridge:
@@ -151,6 +155,10 @@ class Bridge:
     # -- git ----------------------------------------------------------------
 
     def git(self, workdir, *args, check=True):
+        # Always run in the sync workdir. Never run against github.com from
+        # the bridge checkout itself: actions/checkout persists the workflow's
+        # GITHUB_TOKEN as an extraheader there, and a second Authorization
+        # header alongside ours breaks the request.
         res = subprocess.run(
             ["git", "-C", str(workdir), *args],
             env=self.git_env, capture_output=True, text=True,
@@ -168,8 +176,8 @@ class Bridge:
             refs[name[len(prefix) + 1:]] = sha
         return refs
 
-    def remote_tags(self, url):
-        res = self.git(REPO_ROOT, "ls-remote", "--tags", url)
+    def remote_tags(self, workdir, url):
+        res = self.git(workdir, "ls-remote", "--tags", url)
         tags = {}
         for line in res.stdout.splitlines():
             sha, _, ref = line.partition("\t")
@@ -182,13 +190,16 @@ class Bridge:
     # -- GitHub mirror management -------------------------------------------
 
     def ensure_mirror(self, owner, repo, pair, cfg, bb_full):
-        """Create the GitHub mirror repo if needed. Returns True if created."""
+        """Create the GitHub mirror repo if needed.
+
+        Returns (created, default_branch-or-None).
+        """
         status, data = api(f"{GITHUB_API}/repos/{owner}/{repo}",
                            self.gh_headers, allow=(404,))
         if status == 404:
             if self.dry_run:
                 log(f"  [dry-run] would create GitHub repo {owner}/{repo}")
-                return True
+                return True, None
             body = {
                 "name": repo,
                 "private": bool(cfg["private_mirrors"]),
@@ -204,24 +215,26 @@ class Bridge:
             log(f"  + created GitHub mirror {owner}/{repo}")
             log(f"    NOTE: grant the Google Labs Jules GitHub App access to "
                 f"{owner}/{repo} before starting Jules tasks on it.")
-            return True
+            return True, None
 
         # Repo exists: refuse to force-push over anything that isn't marked
         # as a bridge mirror, unless it's empty or explicitly allowed.
+        default_branch = data.get("default_branch")
         topics = data.get("topics") or []
         if MIRROR_TOPIC in topics:
-            return False
+            return False, default_branch
         _, branches = api(f"{GITHUB_API}/repos/{owner}/{repo}/branches?per_page=1",
                           self.gh_headers)
         if branches and not pair.get("allow_existing"):
-            die(f"GitHub repo {owner}/{repo} already exists, is not empty, and is "
+            raise RuntimeError(
+                f"GitHub repo {owner}/{repo} already exists, is not empty, and is "
                 f"not marked as a bridge mirror (topic '{MIRROR_TOPIC}'). Refusing "
                 f"to sync over it. If you are certain, set 'allow_existing: true' "
                 f"for this repo in jules-sync.yml.")
         if not self.dry_run:
             api(f"{GITHUB_API}/repos/{owner}/{repo}/topics", self.gh_headers,
                 "PUT", {"names": sorted(set(topics) | {MIRROR_TOPIC})})
-        return False
+        return False, default_branch
 
     def set_default_branch(self, owner, repo, branch):
         api(f"{GITHUB_API}/repos/{owner}/{repo}", self.gh_headers,
@@ -237,9 +250,13 @@ class Bridge:
         return main or "main"
 
     def ensure_bitbucket_pr(self, ws, slug, branch, dest, gh_owner, gh_repo):
-        q = urllib.parse.quote(f'source.branch.name = "{branch}" AND state = "OPEN"')
+        # A PR in ANY state for this source branch counts as handled, so we
+        # never re-open a PR the user declined or already merged.
+        escaped = branch.replace("\\", "\\\\").replace('"', '\\"')
+        q = urllib.parse.quote(f'source.branch.name = "{escaped}"')
         _, existing = api(
-            f"{BITBUCKET_API}/repositories/{ws}/{slug}/pullrequests?q={q}",
+            f"{BITBUCKET_API}/repositories/{ws}/{slug}/pullrequests"
+            f"?q={q}&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED",
             self.bb_headers)
         if existing.get("values"):
             return
@@ -249,7 +266,8 @@ class Bridge:
             f"?head={gh_owner}:{urllib.parse.quote(branch)}&state=all&per_page=1",
             self.gh_headers)
         mirror_link = (gh_prs[0]["html_url"] if gh_prs
-                       else f"https://github.com/{gh_owner}/{gh_repo}/tree/{branch}")
+                       else f"https://github.com/{gh_owner}/{gh_repo}/tree/"
+                            f"{urllib.parse.quote(branch, safe='/')}")
         title = "Jules: " + (re.sub(r"-\d{15,}$", "", branch).replace("-", " ")
                              or branch)
         description = (
@@ -281,30 +299,36 @@ def load_state(ws, slug):
     path = STATE_DIR / f"{ws}__{slug}.json"
     if path.exists():
         data = json.loads(path.read_text())
-        return path, set(data.get("bitbucket_origin", [])), set(data.get("github_origin", []))
-    return path, set(), set()
+        return (path,
+                set(data.get("bitbucket_origin", [])),
+                set(data.get("github_origin", [])),
+                set(data.get("pr_created", [])))
+    return path, set(), set(), set()
 
 
-def save_state(path, bb_origin, gh_origin):
+def save_state(path, bb_origin, gh_origin, pr_created):
     STATE_DIR.mkdir(exist_ok=True)
     payload = json.dumps(
-        {"bitbucket_origin": sorted(bb_origin), "github_origin": sorted(gh_origin)},
+        {"bitbucket_origin": sorted(bb_origin),
+         "github_origin": sorted(gh_origin),
+         "pr_created": sorted(pr_created)},
         indent=2) + "\n"
     if not path.exists() or path.read_text() != payload:
         path.write_text(payload)
 
 
-def sync_pair(bridge: Bridge, pair: dict, cfg: dict) -> bool:
+def sync_pair(bridge: Bridge, pair: dict, cfg: dict) -> None:
     bb_full = pair["bitbucket"]
     ws, _, slug = bb_full.partition("/")
     if not ws or not slug:
-        die(f"Invalid 'bitbucket' value {bb_full!r}: expected 'workspace/repo-slug'.")
+        raise RuntimeError(
+            f"Invalid 'bitbucket' value {bb_full!r}: expected 'workspace/repo-slug'.")
 
     owner = cfg["mirror_owner"] or bridge.gh_login
     repo = pair.get("github_repo") or f"{slug}{cfg['mirror_suffix']}"
     log(f"\n=== {bb_full}  <->  github.com/{owner}/{repo} ===")
 
-    created = bridge.ensure_mirror(owner, repo, pair, cfg, bb_full)
+    created, mirror_default = bridge.ensure_mirror(owner, repo, pair, cfg, bb_full)
 
     bb_url = f"https://bitbucket.org/{ws}/{slug}.git"
     gh_url = f"https://github.com/{owner}/{repo}.git"
@@ -323,21 +347,22 @@ def sync_pair(bridge: Bridge, pair: dict, cfg: dict) -> bool:
         bb_branches = bridge.local_refs(workdir, "refs/bb")
         gh_branches = bridge.local_refs(workdir, "refs/gh")
 
-        state_path, bb_origin, gh_origin = load_state(ws, slug)
+        state_path, bb_origin, gh_origin, pr_created = load_state(ws, slug)
 
         jules_re = re.compile(cfg["jules_branch_regex"])
-        push_gh, push_bb, new_jules = [], [], []
+        push_gh, push_bb, del_gh = [], [], []
 
         for b, sha in sorted(bb_branches.items()):
-            if jules_re.search(b):
-                # Jules branches are owned by the GitHub side.
+            if jules_re.search(b) or b in gh_origin:
+                # Jules branches, and branches first seen on the mirror
+                # (recorded as github_origin), are owned by the GitHub side.
                 if b in gh_branches:
                     if gh_branches[b] != sha:
                         push_bb.append(f"+refs/gh/{b}:refs/heads/{b}")
-                        log(f"  GH->BB  {b} (Jules update)")
+                        log(f"  GH->BB  {b} (mirror update)")
                 else:
-                    log(f"  ~ {b}: matches the Jules pattern but is missing from "
-                        f"the mirror; leaving the Bitbucket copy untouched")
+                    log(f"  ~ {b}: GitHub-owned but missing from the mirror; "
+                        f"leaving the Bitbucket copy untouched")
                 gh_origin.add(b)
                 bb_origin.discard(b)
             else:
@@ -352,8 +377,7 @@ def sync_pair(bridge: Bridge, pair: dict, cfg: dict) -> bool:
                 continue
             if b in bb_origin:
                 if cfg["prune_mirror_branches"]:
-                    push_gh.append(f":refs/heads/{b}")
-                    bb_origin.discard(b)
+                    del_gh.append(b)
                     log(f"  GH del  {b} (deleted on Bitbucket)")
                 else:
                     log(f"  ~ {b}: deleted on Bitbucket; kept on the mirror "
@@ -365,26 +389,24 @@ def sync_pair(bridge: Bridge, pair: dict, cfg: dict) -> bool:
                 push_bb.append(f"refs/gh/{b}:refs/heads/{b}")
                 gh_origin.add(b)
                 log(f"  GH->BB  {b} (new)")
-                if jules_re.search(b):
-                    new_jules.append(b)
 
         # Tags: Bitbucket -> GitHub, never forced.
         tag_specs = []
         if cfg["sync_tags"]:
             local_tags = bridge.local_refs(workdir, "refs/tags")
             if local_tags:
-                gh_tags = {} if created else bridge.remote_tags(gh_url)
+                gh_tags = {} if created else bridge.remote_tags(workdir, gh_url)
                 tag_specs = [f"refs/tags/{t}:refs/tags/{t}"
                              for t in sorted(local_tags) if t not in gh_tags]
                 for t in tag_specs:
                     log(f"  BB->GH  tag {t.split(':')[0][len('refs/tags/'):]}")
 
-        if not (push_gh or push_bb or tag_specs):
+        if not (push_gh or push_bb or del_gh or tag_specs):
             log("  in sync; nothing to do")
 
         if bridge.dry_run:
             log("  [dry-run] no pushes performed")
-            return True
+            return
 
         if push_gh:
             bridge.git(workdir, "push", gh_url, *push_gh)
@@ -397,20 +419,71 @@ def sync_pair(bridge: Bridge, pair: dict, cfg: dict) -> bool:
             bridge.git(workdir, "push", bb_url, *push_bb)
 
         main = bridge.bb_main_branch(ws, slug, cfg["bitbucket_main_branch"])
-        if created and main in bb_branches:
-            bridge.set_default_branch(owner, repo, main)
 
+        # Keep the mirror's default branch pointed at the Bitbucket main
+        # branch when it was just created, was adopted empty, or is dangling.
+        live = set(bb_branches) | set(gh_branches)
+        if main in bb_branches and mirror_default != main and (
+                created or mirror_default is None or mirror_default not in live):
+            bridge.set_default_branch(owner, repo, main)
+            mirror_default = main
+
+        # Branch deletions are handled separately and are non-fatal: GitHub
+        # refuses to delete the mirror's current default branch.
+        if del_gh:
+            deleting = set(del_gh)
+            if mirror_default in deleting:
+                if main in bb_branches and main not in deleting:
+                    bridge.set_default_branch(owner, repo, main)
+                    mirror_default = main
+                else:
+                    deleting.discard(mirror_default)
+                    log(f"  ! not deleting {mirror_default}: it is the mirror's "
+                        f"default branch and no replacement default exists")
+            if deleting:
+                res = bridge.git(workdir, "push", gh_url,
+                                 *[f":refs/heads/{b}" for b in sorted(deleting)],
+                                 check=False)
+                if res.returncode == 0:
+                    for b in deleting:
+                        bb_origin.discard(b)
+                else:
+                    log(f"  ! branch prune failed; will retry next run: "
+                        f"{res.stderr.strip()[:300]}")
+
+        # Bitbucket PRs for Jules branches. Driven by state, not by "first
+        # sighting", so a failed attempt is retried on the next run.
+        pr_errors = 0
         if cfg["create_bitbucket_prs"]:
-            for b in new_jules:
+            pushed_bb = {s.split(":refs/heads/", 1)[1] for s in push_bb}
+            bb_now = set(bb_branches) | pushed_bb
+            for b in sorted(bb_now):
+                if not jules_re.search(b) or b in pr_created:
+                    continue
+                head_ref = f"refs/gh/{b}" if b in gh_branches else f"refs/bb/{b}"
+                if main in bb_branches:
+                    merged = bridge.git(workdir, "merge-base", "--is-ancestor",
+                                        head_ref, f"refs/bb/{main}",
+                                        check=False).returncode == 0
+                    if merged:
+                        pr_created.add(b)  # already in main; nothing to open
+                        continue
                 try:
                     bridge.ensure_bitbucket_pr(ws, slug, b, main, owner, repo)
+                    pr_created.add(b)
                 except RuntimeError as e:
-                    log(f"  ! could not open Bitbucket PR for {b}: {e}")
+                    pr_errors += 1
+                    log(f"  ! could not open Bitbucket PR for {b} "
+                        f"(will retry next run): {e}")
 
         # Drop state entries for branches that no longer exist on either side.
-        live = set(bb_branches) | set(gh_branches)
-        save_state(state_path, bb_origin & live, gh_origin & live)
-        return True
+        save_state(state_path,
+                   bb_origin & live,
+                   gh_origin & live,
+                   pr_created & live)
+
+        if pr_errors:
+            raise RuntimeError(f"{pr_errors} Bitbucket PR(s) could not be created")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -434,14 +507,16 @@ def main():
 
     failures = 0
     for pair in repos:
-        if not isinstance(pair, dict) or "bitbucket" not in pair:
-            die("each entry under 'repos:' needs a 'bitbucket: workspace/repo-slug' key")
         try:
+            if not isinstance(pair, dict) or "bitbucket" not in pair:
+                raise RuntimeError("each entry under 'repos:' needs a "
+                                   "'bitbucket: workspace/repo-slug' key")
             sync_pair(bridge, pair, {**cfg, **{k: v for k, v in pair.items()
                                                if k in DEFAULTS}})
-        except RuntimeError as e:
+        except Exception as e:
             failures += 1
-            log(f"  ! sync failed for {pair['bitbucket']}: {e}")
+            name = pair.get("bitbucket", "<invalid entry>") if isinstance(pair, dict) else "<invalid entry>"
+            log(f"  ! sync failed for {name}: {e}")
 
     if failures:
         die(f"{failures} repo(s) failed to sync")
